@@ -1,0 +1,808 @@
+/**
+ * Builds an in-memory data table from the input sheet using parameter settings.
+ *
+ * It uses:
+ *   - The "Input Sheet" parameter to determine the input sheet name.
+ *   - The "Table Header Row" parameter to get the header row number.
+ *   - The "jeellyfish_line_item" group in the parameters to map header columns.
+ *
+ * For each row in the input sheet (starting at header row+1, until a blank row is encountered),
+ * the function builds an object where:
+ *   - For groupings with a single mapping, the object gets an entry with key = object_api_name.
+ *   - For groupings with multiple mappings, the values are nested under the group key.
+ *
+ * @returns {Array<Object>} An array of records representing the data table.
+ */
+function buildDataTableFromParamsDynamic(ss) {
+  logMessage(ss,"Starting buildDataTableFromParamsDynamic with " + ss + ".");
+  
+  // Load parameters.
+  var params = loadParametersFromJson(ss);
+  logMessage(ss,"Loaded parameters: " + JSON.stringify(params));
+  
+  Logger.log("Your Parames Are: " + params );
+
+  var inputSheetName = params["Input Sheet"].Name;
+  var headerRowNumber = params["Table Header Row"].Name;
+  
+  var sheet = ss.getSheetByName(inputSheetName);
+  if (!sheet) {
+    throw new Error("Input sheet '" + inputSheetName + "' not found.");
+  }
+  logMessage(ss,"Processing input sheet: " + inputSheetName + ", header row: " + headerRowNumber);
+  
+  // Read the header row.
+  var lastColumn = sheet.getLastColumn();
+  var headerRow = sheet.getRange(headerRowNumber, 1, 1, lastColumn).getValues()[0];
+  
+  // Build mapping for each grouping (keys other than "Input Sheet" and "Table Header Row").
+  var overallMapping = {}; // key: grouping key, value: array of mapping objects { api: <object_api_name>, col: <columnIndex> }
+  for (var key in params) {
+    if (key === "Input Sheet" || key === "Table Header Row") {
+      continue;
+    }
+    // For each grouping, normalize value to an array.
+    var groupData = params[key];
+    var groupArray = Array.isArray(groupData) ? groupData : [groupData];
+    overallMapping[key] = [];
+    
+    for (var i = 0; i < groupArray.length; i++) {
+      var item = groupArray[i];
+      if (!item.object_label || !item.object_api_name) {
+        continue;
+      }
+      var labelToFind = String(item.object_label).trim();
+      var apiName = item.object_api_name;
+      var found = false;
+      for (var j = 0; j < headerRow.length; j++) {
+        if (String(headerRow[j]).trim() === labelToFind) {
+          overallMapping[key].push({ api: apiName, col: j });
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        logMessage(ss,"Warning: Header label '" + labelToFind + "' for group '" + key + "' not found.");
+      }
+    }
+  }
+  
+  logMessage(ss,"Final overall mapping: " + JSON.stringify(overallMapping));
+  
+  // Read data rows from headerRowNumber + 1 until a blank row is encountered.
+  var lastRow = sheet.getLastRow();
+  var dataRange = sheet.getRange(headerRowNumber + 1, 1, lastRow - headerRowNumber, lastColumn);
+  var dataRows = dataRange.getValues();
+  
+  var records = [];
+  for (var r = 0; r < dataRows.length; r++) {
+    var row = dataRows[r];
+    // Stop if the first cell is blank (assumes that indicates end-of-data).
+    if (row[0] === "" || row[0] === null) {
+      logMessage(ss,"Blank row encountered at row " + (headerRowNumber + 1 + r) + ". Stopping data processing.");
+      break;
+    }
+    
+    var record = {};
+    // For each group in the overall mapping, assign values.
+    for (var group in overallMapping) {
+      var mappings = overallMapping[group];
+      if (mappings.length === 0) continue;
+      
+      // If only one mapping, add directly under its API field.
+      if (mappings.length === 1) {
+        record[mappings[0].api] = row[mappings[0].col];
+      } else {
+        // If multiple mappings, nest the values under the group key.
+        record[group] = {};
+        for (var k = 0; k < mappings.length; k++) {
+          record[group][mappings[k].api] = row[mappings[k].col];
+        }
+      }
+    }
+    records.push(record);
+    // logMessage(ss,"Processed row " + (headerRowNumber + 1 + r) + ": " + JSON.stringify(record));
+  }
+  
+  logMessage(ss,"Built data table with " + records.length + " records.");
+  logMessage(ss,"Final Data Table:\n" + JSON.stringify(records, null, 2));
+  flushLogs(ss);
+  return records;
+}/**
+ * processOliRecords(ss)
+ *
+ * End-to-end function to process Opportunity Line Items (OLIs).
+ *
+ * Steps:
+ * 1. Load parameters from the "JF_SCRIPT_PARAMS" sheet.
+ * 2. Build the in-memory OLI table from the input sheet using the parameter mappings.
+ * 3. Deactivate any existing active OLIs for the Opportunity.
+ * 4. Retrieve the highest existing revision number for OLIs and compute the new revision.
+ * 5. For each new OLI record, set:
+ *    - Opportunity__c to the given Opportunity Id.
+ *    - Active__c to true.
+ *    - Version_Number__c to (highest revision + 1).
+ * 6. Insert the new OLI records into Salesforce.
+ *
+ * This function leverages:
+ *    - exampleLoadParameters() [from your parameter loader code]
+ *    - buildOliDataTableFromParams() [from your OLI builder code]
+ *    - Library functions from Jellyfish Revops SFDC Integrations:
+ *         getHighestRevisionNumber(oppId)
+ *         deactivateAllActiveLineItems(oppId)
+ *         createLineItems(oppId, lineItems)
+ *
+ * @returns {Object} An object summarizing the deactivation and insertion results.
+ */
+function processOliRecords(ss) {
+  try {
+    // STEP 1: Load parameters from the parameter sheet.
+    // This function returns an object of parameters (including Input Sheet, Table Header Row, and oli mappings).
+    var params = exampleLoadParameters(ss);
+    // logMessage(ss,"Parameters loaded successfully: " + JSON.stringify(params, null, 2));
+    
+    // STEP 2: Build the in-memory OLI table from the input sheet.
+    var oliData = buildDataTableFromParamsDynamic(ss);
+    logMessage(ss,"OLI Data Table built successfully. Number of records: " + oliData.length);
+    
+    var oppId = oliData[0]["jellyfish_line_item__c"]["opportunity_id__c"];
+    logMessage(ss,'Found Opportunity ID: ' + oppId)
+    // STEP 3: Query and deactivate existing active OLIs.
+    // Note: The library functions are referenced via the attached library namespace.
+    
+    var deactivationResults = deactivateAllActiveLineItems(oppId);
+    logMessage(ss,"Deactivation results:\n" + JSON.stringify(deactivationResults, null, 2));
+    
+    // STEP 4: Retrieve the highest revision number from Salesforce.
+    var highestRevision = getHighestRevisionNumber(oppId);
+
+    var newRevision = highestRevision + 1;
+    logMessage(ss,"Highest Revision: " + highestRevision + ", New Revision: " + newRevision);
+    
+    // STEP 5: Augment each new OLI record with necessary fields.
+    for (var i = 0; i < oliData.length; i++) {
+      var record = oliData[i];
+      // Ensure the Opportunity__c field is set.
+      record.opportunity_id__c = oppId;
+      // Set the Active__c flag to true.
+      record.Active__c = true;
+      // Set the Version_Number__c field to the new revision number.
+      record.Version_Number__c = newRevision;
+    }
+    logMessage(ss,"New OLI records after augmentation:\n" + JSON.stringify(oliData, null, 2));
+    
+    // STEP 6: Insert new OLI records into Salesforce.
+
+    formattedOliData = formatOLIs(oliData); 
+    logMessage(ss,formattedOliData)
+
+    var insertionResults = createLineItems(oppId, formattedOliData);
+    
+    logMessage(ss,"Insertion results:\n" + JSON.stringify(insertionResults, null, 2));
+    
+    // Return a summary of the operations.
+    var resultSummary = {
+      deactivation: deactivationResults,
+      insertion: insertionResults
+    };
+    logMessage(ss,"Process completed successfully:\n" + JSON.stringify(resultSummary, null, 2));
+    return resultSummary;
+    
+  } catch (e) {
+    logMessage(ss,"Error in processOliRecords: " + e.message);
+    throw e;
+  }
+}
+
+/**
+ * Flattens the records produced by buildDataTableFromParamsDynamic().
+ *
+ * Each record from buildDataTableFromParamsDynamic() may have nested groups (for example,
+ * under the key "jellyfish_line_item__c") that hold the field mappings. This function merges
+ * those nested objects into the top-level record.
+ *
+ * @param {Array<Object>} oliData - The array of OLI records as built by buildDataTableFromParamsDynamic().
+ * @returns {Array<Object>} - An array of flattened OLI records, ready to be sent to createLineItems().
+ */
+function formatOLIs(oliData) {
+  var formatted = [];
+  for (var i = 0; i < oliData.length; i++) {
+    var record = oliData[i];
+    var flatRecord = {};
+    
+    // Loop through each key in the record.
+    for (var key in record) {
+      if (record.hasOwnProperty(key)) {
+        // If the value is an object (and not null), merge its properties.
+        // This assumes that any nested object (e.g. "jellyfish_line_item__c") should be flattened.
+        if (typeof record[key] === 'object' && record[key] !== null) {
+          for (var nestedKey in record[key]) {
+            if (record[key].hasOwnProperty(nestedKey)) {
+              flatRecord[nestedKey] = record[key][nestedKey];
+            }
+          }
+        } else {
+          // Otherwise, keep the top-level property.
+          flatRecord[key] = record[key];
+        }
+      }
+    }
+    formatted.push(flatRecord);
+  }
+  return formatted;
+}
+
+
+/**
+ * Example usage: Call this function to run the entire end-to-end operation.
+ */
+function processJellyfishLineItems(ss) {
+  var startTime = new Date(); // Capture the start time
+  logMessage(ss,"Starting processJellyfishLineItems at " + startTime.toISOString());
+
+  var results = processOliRecords(ss);
+
+  var endTime = new Date(); // Capture the end time
+  var executionTime = (endTime - startTime) / 1000; // Convert to seconds
+
+  logMessage(ss,"Completed processJellyfishLineItems at " + endTime.toISOString());
+  logMessage(ss,"Total Execution Time: " + executionTime.toFixed(2) + " seconds");
+  logMessage(ss, "Final results:\n" + JSON.stringify(results, null, 2));
+  
+  flushLogs(ss);
+  return results;
+}
+/**
+ * Logs a message to both Logger and the "JF_SCRIPT_LOG" sheet.
+ * If the log sheet does not exist, it is created and headers are added.
+ *
+ * @param {String} message The message to log.
+ */
+
+var DEBUG_MODE = true; // Set to true for debugging
+
+var logBuffer = [];
+
+function logMessage(ss, message) {
+  if (DEBUG_MODE) {
+    Logger.log(message);
+    // Optionally, write to a custom log sheet if needed.
+    var logSheet = ss.getSheetByName("JF_SCRIPT_LOG");
+    
+    if (!logSheet) {
+      logSheet = ss.insertSheet("JF_SCRIPT_LOG");
+      logSheet.appendRow(["Timestamp", "Message"]);
+    }
+    
+    var timestamp = new Date();
+    logSheet.appendRow([timestamp, message]);
+  }
+  logBuffer.push({
+    timestamp: new Date(),
+    message: message
+  });
+}
+
+function flushLogs(ss) {
+  if (logBuffer.length > 0) {
+    var logSheet = ss.getSheetByName("JF_SCRIPT_LOG");
+    if (!logSheet) {
+      logSheet = ss.insertSheet("JF_SCRIPT_LOG");
+      logSheet.appendRow(["Timestamp", "Message"]);
+    }
+    
+    // Map each log entry to a row, preserving the original timestamp.
+    var logRows = logBuffer.map(function(logEntry) {
+      return [logEntry.timestamp, logEntry.message];
+    });
+    
+    // Append the rows starting from the next empty row.
+    logSheet.getRange(logSheet.getLastRow() + 1, 1, logRows.length, logRows[0].length)
+            .setValues(logRows);
+    
+    // Clear the buffer after flushing.
+    logBuffer = [];
+  }
+}/**
+ * Loads the parameter JSON strings from the "JF_SCRIPT_PARAMS" sheet and returns a dictionary.
+ *
+ * Each row in column A should contain a valid JSON string.
+ * For example:
+ *   {"Input Sheet":{"Name":"Test Opp"}}
+ *   {"Table Header Row":{"Name":1}}
+ *   {"oli":{"object_label":"Opportunity","object_api_name":"Opportunity__c"}}
+ *   {"oli":{"object_label":"Product","object_api_name":"Product__c"}}
+ *   {"un":{"object_label":"Customer ID","object_api_name":"Customer_ID__c"}}
+ *   {"un":{"object_label":"Customer Name","object_api_name":"Customer_Name__c"}}
+ *
+ * The function works as follows:
+ *   - It first reads all rows from column A.
+ *   - It checks whether the first row is a header row by attempting to parse its cell.
+ *     If it fails, it assumes that row 1 is a header and starts processing from row 2.
+ *   - For each parsed JSON object, it iterates over its top-level keys.
+ *     If a key already exists in the resulting dictionary:
+ *       - If its value is not already an array, convert it to an array.
+ *       - Then push the new value.
+ *     Otherwise, store it directly.
+ *
+ * @returns {Object} A dictionary of parameters.
+ */
+function loadParametersFromJson(ss) {
+  logMessage(ss,"Starting loadParametersFromJson()", ss);
+  
+  var sheet = ss.getSheetByName("JF_SCRIPT_PARAMS");
+  if (!sheet) {
+    logMessage(ss,"Sheet 'JF_SCRIPT_PARAMS' not found.");
+    throw new Error("Sheet 'JF_SCRIPT_PARAMS' not found.");
+  }
+  
+  var lastRow = sheet.getLastRow();
+  logMessage(ss,"Detected last row in JF_SCRIPT_PARAMS: " + lastRow);
+  if (lastRow < 1) {
+    logMessage(ss,"No data found in 'JF_SCRIPT_PARAMS' sheet.");
+    throw new Error("No data found in 'JF_SCRIPT_PARAMS' sheet.");
+  }
+  
+  // Read all rows from column A.
+  var data = sheet.getRange(1, 1, lastRow, 1).getValues();
+  logMessage(ss,"Raw JSON data: " + JSON.stringify(data));
+  
+  // Determine whether the first row is a header.
+  var startRow = 0;
+  try {
+    var testCell = String(data[0][0]).trim();
+    JSON.parse(testCell);
+    // If parsing succeeds, no header row is present.
+  } catch (e) {
+    // logMessage(ss,"First row did not parse as JSON. Assuming it is a header row and skipping it.");
+    startRow = 1;
+  }
+  
+  var params = {};
+  
+  // Process each row from startRow onward.
+  for (var i = startRow; i < data.length; i++) {
+    var cellValue = String(data[i][0]).trim();
+    if (!cellValue) {
+      logMessage(ss,"Skipping blank cell at row " + (i + 1));
+      continue;
+    }
+    
+    try {
+      var parsed = JSON.parse(cellValue);
+      // logMessage(ss,"Parsed JSON at row " + (i + 1) + ": " + JSON.stringify(parsed));
+      
+      // For each top-level key in the parsed object:
+      for (var key in parsed) {
+        var value = parsed[key];
+        // If the key already exists, aggregate it.
+        if (params.hasOwnProperty(key)) {
+          if (!Array.isArray(params[key])) {
+            // Convert to array if it isn't already.
+            params[key] = [ params[key] ];
+          }
+          params[key].push(value);
+          // logMessage(ss,"Appended parameter for key '" + key + "': " + JSON.stringify(value));
+        } else {
+          // Otherwise, set it directly.
+          params[key] = value;
+          // logMessage(ss,"Added parameter: '" + key + "' -> " + JSON.stringify(value));
+        }
+      }
+    } catch (e) {
+      logMessage(ss,"Error parsing JSON at row " + (i + 1) + ": " + e.message);
+      throw new Error("Error parsing JSON at row " + (i + 1) + ": " + e.message);
+    }
+  }
+  
+  logMessage(ss,"Finished loadParametersFromJson(). Final parameters: " + JSON.stringify(params));
+  flushLogs(ss);
+  return params;
+}
+
+/**
+ * Example usage of loadParametersFromJson().
+ */
+function exampleLoadParameters(ss) {
+  var params = loadParametersFromJson(ss);
+  logMessage(ss,"Loaded Parameters:\n" + JSON.stringify(params, null, 2));
+  return params;
+}
+  /**
+   * Converts a single-row range into a grouped JSON string.
+   *
+   * The range should be formatted as:
+   *   GroupName, Key1, Value1, Key2, Value2, ... 
+   * Processing stops when a blank key is encountered.
+   *
+   * Example:
+   *   If the row contains:
+   *     ["MyGroup", "Name", "John", "Age", "30", "", "ignored"]
+   *   The function returns:
+   *     {"MyGroup": {"Name": "John", "Age": "30"}}
+   *
+   * @param {range} inputRange A single-row range containing the group name and key/value pairs.
+   * @return {String} A JSON string representing the grouped key/value pairs.
+   * @customfunction
+   */
+  function JSONIFY_groupname_key_value_pairings(inputRange) {
+    // Ensure the input range is valid and use the first (and only) row.
+    if (!inputRange || inputRange.length < 1) {
+      return "Error: Input range must contain at least one row.";
+    }
+    var row = inputRange[0];
+    if (row.length < 1) {
+      return "Error: Input row must contain at least one cell for the group name.";
+    }
+    
+    // The first cell is the overall group name.
+    var groupName = row[0];
+    if (groupName === null || groupName === undefined || groupName.toString().trim() === "") {
+      return "Error: Group name (first cell) is blank.";
+    }
+    
+    // Process the remaining cells as key/value pairs.
+    var obj = {};
+    // Start at index 1 (the second cell)
+    for (var i = 1; i < row.length; i += 2) {
+      var key = row[i];
+      // Stop processing if key is blank.
+      if (key === null || key === undefined || key.toString().trim() === "") {
+        break;
+      }
+      // Get the corresponding value (if available).
+      var value = (i + 1 < row.length) ? row[i + 1] : null;
+      obj[key] = value;
+    }
+    
+    // Build the final object and return its JSON representation.
+    var result = {};
+    result[groupName] = obj;
+    return JSON.stringify(result);
+  }
+function getSalesforceAccessToken() {
+  const props = PropertiesService.getScriptProperties();
+  
+  // Retrieve Salesforce credentials from Script Properties
+  const instanceUrl   = props.getProperty('SF_INSTANCE_URL');      // e.g., "https://myDomain.my.salesforce.com"
+  const clientId      = props.getProperty('SF_CLIENT_ID');         // Consumer Key
+  const clientSecret  = props.getProperty('SF_CLIENT_SECRET');     // Consumer Secret
+
+  // Build the token endpoint URL
+  const tokenUrl = instanceUrl + 'services/oauth2/token';
+  Logger.log('Requesting token from URL: ' + tokenUrl);
+
+  // Payload for username-password flow
+  const payload = {
+    'grant_type':    'client_credentials',
+    'client_id':     clientId,
+    'client_secret': clientSecret,
+  };
+
+  // Configure the request
+  const options = {
+    method: 'post',
+    payload: payload,
+    muteHttpExceptions: true
+  };
+
+  // Make the call
+  let response;
+  try {
+    response = UrlFetchApp.fetch(tokenUrl, options);
+  } catch (e) {
+    Logger.log('Error making token request: ' + e);
+    throw new Error('Failed to reach Salesforce token endpoint: ' + e);
+  }
+  
+  // Log the HTTP status code
+  Logger.log('Response Code: ' + response.getResponseCode());
+
+  // Parse the JSON response
+  const body = response.getContentText();
+  Logger.log('Response Body: ' + body);
+  
+  let json;
+  try {
+    json = JSON.parse(body);
+  } catch (e) {
+    Logger.log('JSON parse error: ' + e);
+    throw new Error('Invalid JSON response from token request: ' + e);
+  }
+
+  // Check for access token
+  if (json.access_token) {
+    Logger.log('Successfully retrieved access token: ' + json.access_token);
+    return json.access_token;
+  } else {
+    Logger.log('Failed to get access token. Full response: ' + body);
+    throw new Error('Failed to get access token: ' + body);
+  }
+}/**
+ * Creates one or more line items for a given Opportunity.
+ * @param {String} oppId Salesforce Opportunity Id (e.g. "006XXXXXXXXXXXX").
+ * @param {Array<Object>} lineItems An array of JS objects with all necessary fields.
+ *   Example lineItem object:
+ *   {
+ *     Product__c: '01tXXXXXXXXXXXX',    // required
+ *     Price_Book__c: '01sXXXXXXXXXXXX', // required
+ *     Quantity__c: 10,
+ *     List_Price__c: 500.00,
+ *     Sales_Price__c: 450.00,
+ *     Active__c: true,
+ *     Start_Date__c: '2025-02-01',
+ *     End_Date__c: '2025-12-31',
+ *     // etc.
+ *   }
+ * @returns {Array} Array of results from Salesforce for each inserted record.
+ */
+function createLineItems(oppId, lineItems) {
+  const token = getSalesforceAccessToken();
+  const instanceUrl = PropertiesService.getScriptProperties().getProperty('SF_INSTANCE_URL');
+  const baseUrl = instanceUrl + '/services/data/v58.0/composite/sobjects';
+
+  // Prepare the array of records
+  const records = lineItems.map(item => {
+    // Ensure the opportunity_id__c field is set and adjust the discount
+    item.opportunity_id__c = oppId;
+    item.Sales_Discount__c = 100 * item.Sales_Discount__c;
+    
+    // Include the attributes required for the composite API
+    return {
+      attributes: { type: 'jellyfish_line_item__c' },
+      ...item
+    };
+  });
+  
+  const payload = {
+    allOrNone: false,  // Set to true if you want the entire transaction to roll back on failure
+    records: records
+  };
+
+  const options = {
+    method: 'post',
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'Content-Type': 'application/json'
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(baseUrl, options);
+  const json = JSON.parse(response.getContentText());
+  return json;
+}
+
+function createLineItems_dep(oppId, lineItems) {
+  const token = getSalesforceAccessToken();
+  const instanceUrl = PropertiesService.getScriptProperties().getProperty('SF_INSTANCE_URL');
+  const baseUrl = instanceUrl + '/services/data/v58.0/sobjects/jellyfish_line_item__c';
+
+  const results = [];
+
+  lineItems.forEach(item => {
+    // Add the opportunity_id__c field if not already included
+    item.opportunity_id__c = oppId;
+    item.Sales_Discount__c = 100 * item.Sales_Discount__c;
+    const options = {
+      method: 'post',
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'Content-Type': 'application/json'
+      },
+      payload: JSON.stringify(item),
+      muteHttpExceptions: true
+    };
+
+    const response = UrlFetchApp.fetch(baseUrl, options);
+    const json = JSON.parse(response.getContentText());
+    results.push(json);
+  });
+
+  return results;
+}
+
+/**
+ * Gets the highest revision (Version_Number__c) among line items for the given Opportunity.
+ * @param {String} oppId - The Salesforce Opportunity Id (e.g., "006XXXXXXXXXXXX").
+ * @returns {Number} The highest version number found, or 0 if none exist.
+ */
+function getHighestRevisionNumber(oppId) {
+  // 1) Obtain token and instance URL
+  const token = getSalesforceAccessToken();
+  const instanceUrl = PropertiesService.getScriptProperties().getProperty('SF_INSTANCE_URL');
+
+  // 2) Build SOQL query: sort descending by Version_Number__c, grab top 1
+  const soql = `
+    SELECT Version_Number__c
+    FROM jellyfish_line_item__c
+    WHERE opportunity_id__c = '${oppId}'
+    ORDER BY Version_Number__c DESC
+    LIMIT 1
+  `;
+  const queryUrl = instanceUrl + '/services/data/v58.0/query?q=' + encodeURIComponent(soql);
+
+  // 3) Make the query call
+  const options = {
+    method: 'get',
+    headers: {
+      Authorization: 'Bearer ' + token
+    },
+    muteHttpExceptions: true
+  };
+  const response = UrlFetchApp.fetch(queryUrl, options);
+  const body = JSON.parse(response.getContentText());
+
+  // 4) Check if we got any records
+  if (body.records && body.records.length > 0) {
+    // Return the highest version number
+    return body.records[0].Version_Number__c || 0;
+  } else {
+    // If no records, return 0
+    return 0;
+  }
+}
+
+/**
+ * Deactivate all active jellyfish_line_item__c records for a given Opportunity.
+ * @param {String} oppId - The Salesforce Opportunity Id (e.g. "006XXXXXXXXXXXX").
+ * @returns {Array} Array of results indicating the status for each record updated.
+ */
+function deactivateAllActiveLineItems(oppId) {
+  const token = getSalesforceAccessToken();
+  const instanceUrl = PropertiesService.getScriptProperties().getProperty('SF_INSTANCE_URL');
+  const baseUrl = instanceUrl + '/services/data/v58.0/composite/sobjects';
+
+  // Retrieve the list of active line item IDs for the opportunity.
+  // This function should return an array of IDs (e.g., ['a1Bxxx', 'a1Byyy', ...]).
+  const activeLineItemIds = getActiveLineItemIds(oppId);
+  
+  // Build the records array with updates: setting Active__c to false.
+  const records = activeLineItemIds.map(recordId => ({
+    attributes: { type: 'jellyfish_line_item__c' },
+    Id: recordId,
+    Active__c: false
+  }));
+
+  const payload = {
+    allOrNone: false,  // Adjust according to your rollback policy
+    records: records
+  };
+
+  const options = {
+    method: 'patch',  // Use PATCH for updates
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'Content-Type': 'application/json'
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(baseUrl, options);
+  const json = JSON.parse(response.getContentText());
+  return json;
+}
+
+/**
+ * Retrieves the IDs of active line items for the specified opportunity.
+ * @param {String} oppId - The Salesforce Opportunity ID.
+ * @return {Array<String>} An array of active line item record IDs.
+ */
+function getActiveLineItemIds(oppId) {
+  const token = getSalesforceAccessToken();
+  const instanceUrl = PropertiesService.getScriptProperties().getProperty('SF_INSTANCE_URL');
+  const query = `SELECT Id FROM jellyfish_line_item__c WHERE opportunity_id__c = '${oppId}' AND Active__c = true`;
+  const baseUrl = instanceUrl + '/services/data/v58.0/query/?q=' + encodeURIComponent(query);
+
+  const options = {
+    method: 'get',
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'Content-Type': 'application/json'
+    },
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(baseUrl, options);
+  const json = JSON.parse(response.getContentText());
+  
+  if (!json.records) {
+    throw new Error("No records found or error in query: " + JSON.stringify(json));
+  }
+  
+  return json.records.map(record => record.Id);
+}
+
+function deactivateAllActiveLineItems_dep(oppId) {
+  // 1) Get the token and instance URL
+  const token = getSalesforceAccessToken();
+  const instanceUrl = PropertiesService.getScriptProperties().getProperty('SF_INSTANCE_URL');
+
+  // 2) Query to find all active line items for the specified Opp
+  const soql = `
+    SELECT Id
+    FROM jellyfish_line_item__c
+    WHERE opportunity_id__c = '${oppId}'
+    AND Active__c = true
+  `;
+  const queryUrl = instanceUrl + '/services/data/v58.0/query?q=' + encodeURIComponent(soql);
+
+  // 3) Execute the query
+  const queryOptions = {
+    method: 'get',
+    headers: {
+      Authorization: 'Bearer ' + token
+    },
+    muteHttpExceptions: true
+  };
+  const queryResponse = UrlFetchApp.fetch(queryUrl, queryOptions);
+  const queryBody = JSON.parse(queryResponse.getContentText());
+  
+  // If no records or an error occurred, return early
+  if (!queryBody.records || !Array.isArray(queryBody.records)) {
+    return [{
+      status: queryResponse.getResponseCode(),
+      error: queryBody
+    }];
+  }
+
+  // 4) For each active line item, PATCH Active__c = false
+  const results = [];
+  for (const record of queryBody.records) {
+    const lineItemId = record.Id;
+    const url = instanceUrl + '/services/data/v58.0/sobjects/jellyfish_line_item__c/' + lineItemId;
+    
+    const payload = { Active__c: false };
+    const patchOptions = {
+      method: 'patch',
+      headers: {
+        Authorization: 'Bearer ' + token,
+        'Content-Type': 'application/json'
+      },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    };
+    
+    const patchResponse = UrlFetchApp.fetch(url, patchOptions);
+    results.push({
+      id: lineItemId,
+      status: patchResponse.getResponseCode(),
+      body: patchResponse.getContentText()
+    });
+  }
+
+  // 5) Return an array of result objects
+  return results;
+}
+
+
+
+function testCreateLineItems() {
+  const oppId = '0068b00000ABCDEFG'; // example
+  const newItems = [
+    {
+      Product__c: '01t8b00000ABCD1234',
+      Price_Book__c: '01s8b00000XYZ9876',
+      Quantity__c: 10,
+      List_Price__c: 500.00,
+      Sales_Price__c: 450.00,
+      Active__c: true,
+      Start_Date__c: '2025-02-01',
+      End_Date__c: '2025-12-31',
+      Version_Number__c: 1
+    },
+    {
+      Product__c: '01t8b00000ABCD5678',
+      Price_Book__c: '01s8b00000XYZ6543',
+      Quantity__c: 3,
+      List_Price__c: 1000.00,
+      Sales_Price__c: 950.00,
+      Active__c: true
+    }
+  ];
+
+  const results = createLineItems(oppId, newItems);
+  Logger.log(JSON.stringify(results, null, 2));
+}
